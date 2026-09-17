@@ -1,0 +1,35 @@
+---
+title: "Andrew Wilber Analysis Hub"
+---
+## Who is Andrew Wilber
+I am a municipal finance and economic forecasting professional working for the New York City Council's Finance Division. My core focus is forecasting National and NYC economic indicators and NYC tax revenues as part of the Council's oversight responsibility of each financial plan proposed by the Mayor's Office.  Aside from economic / revenue forecasting, I develop statistical models to study the economic and fiscal impact of any financial legislation proposed by the City Council. 
+
+I have an MBA in Finance and Information Systems from Fordham University and am currently pursuing an MS in Statistics at Baruch College, with a particular interest in applying statistical modeling, programming, and data visualization to public finance and policy analysis.
+
+```{r}
+#| include: false
+1+1
+```
+--------------
+Last Updated: `r format(Sys.time(), "%A %m %d, %Y at %H:%M%p")`
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+
+if(!require("leaflet")){
+    options(repos=c(CRAN="https://cloud.r-project.org"))
+    install.packages("leaflet")
+    stopifnot(require("leaflet"))
+}
+
+baruch_longitude <- -73.98333
+baruch_latitude  <- +40.74028
+
+leaflet() |>
+  addTiles() |>
+  setView(baruch_longitude, baruch_latitude, zoom=17) |>
+  addPopups(baruch_longitude, baruch_latitude, 
+            "Statistics Grad Student at <b>Baruch College</b>")
+```
