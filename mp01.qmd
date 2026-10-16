@@ -1,7 +1,589 @@
+---
+title: "What We Watched: Exploring Netflix Viewing Data"
+author: "Andrew Wilber"
+format: html
+---
 
-  ---
-  title: "Mini-Project Placeholder"
-  ---
+```{r}
+#' Acquire Netflix What We Watched Reports
+#' 
+#' This function will acquire and standardize all data for MP#01
+#' from Netflix. Because Netflix hosts the data files behind a CDN, we
+#' are accessing the release pages and automatically extracting links to the
+#' relevant files (with CDN hash). 
+#' 
+#' After import, files are stacked vertically and some basic cleaning is
+#' performed. 
+load_netflix_data <- function(){
+  # Note to students: Make sure you have installed the tidyverse and fs packages
+  #                   before beginning this assignment. If you aren't sure,
+  #                   simply run `library(tidyverse)` at your R Console and, if
+  #                   you don't see an error message, `tidyverse` has been 
+  #                   installed. (Same for `fs`) If you still need to install
+  #                   either package, use the `install.packages` function as 
+  #                   demonstrated in class.
+  library(tidyverse)
+  library(rvest)
+  library(readxl)
+  library(fs)
+  library(skimr)
+  library(scales)
+  library(gt)
+  library(ggtext)
   
-  This is a placeholder for STA9750 Mini-Project 1. Check back soon for more!
+  data_dir <- path("data", "mp01")
+    
+  if(!dir_exists(data_dir)){
+    dir_create(data_dir, showWarnings=FALSE, recurse=TRUE)
+  }
   
+  NETFLIX_URLS <- list(
+    `2023H1` = "https://about.netflix.com/news/what-we-watched-a-netflix-engagement-report",
+    `2023H2` = "https://about.netflix.com/news/what-we-watched-the-second-half-of-2023",
+    `2024H1` = "https://about.netflix.com/news/what-we-watched-the-first-half-of-2024",
+    `2024H2` = "https://about.netflix.com/news/what-we-watched-the-second-half-of-2024",
+    `2025H1` = "https://about.netflix.com/news/what-we-watched-the-first-half-of-2025",
+    `2025H2` = "https://about.netflix.com/news/what-we-watched-the-second-half-of-2025",
+    `2026H1` = "https://about.netflix.com/news/what-we-watched-the-first-half-of-2026"
+  )
+  
+  download_if_needed <- function(url, local){
+    if(!file_exists(local)){
+      download.file(url, local, quiet = TRUE, mode = "wb")
+    }
+    
+    return(local)
+  }
+    
+  NETFLIX_URLS |> 
+    map(read_html) |> 
+    map(html_element, xpath = "//a[contains(@href, '.xlsx')]") |> 
+    map_chr(html_attr, "href") |> 
+    enframe("period", "url") |> 
+   mutate(path = path(data_dir, paste0(period, ".xlsx")), 
+          path = map2(url, path, download_if_needed), 
+          data = map(path, read_excel, skip=3, na="*"), 
+          data = map(data, \(x) x |> mutate(`Release Date` = as.Date(`Release Date`)))) |>
+    unnest(data) |> 
+    select(-url, -path) |> 
+    mutate(year=str_sub(period, 1, 4), 
+           half=str_sub(period, start=6), 
+           period_start = make_date(year, if_else(half==1, 1, 7), 1), 
+           period_end = make_date(year, if_else(half==1, 7, 12), if_else(half==1, 30, 31))) |> 
+    filter(!is.na(`Hours Viewed`)) |> 
+    mutate(live_event = !is.na(Runtime) & str_detect(Runtime, "\\d+:\\d+\\*"), 
+           clean_time = str_remove(Runtime, fixed("*")),
+           Runtime = 60 * hour(hm(clean_time)) + minute(hm(clean_time))) |>
+    select(-clean_time) |>
+    mutate(Runtime = coalesce(Runtime, mean(Runtime, na.rm=TRUE)), 
+           .by=Title, 
+           Title = stringi::stri_trans_general(Title, "Latin-ASCII"),
+           Title = str_remove(Title, " // .*"), 
+           Title = str_remove(Title, "[^[:ascii:]].*"), 
+           Title = str_trim(Title)) |>
+    filter_out(Title == "") |>
+    select(year, 
+           period, 
+           period_start, 
+           period_end, 
+           Title, 
+           -half, 
+           Runtime, 
+           Views, 
+           `Hours Viewed`, 
+           `Release Date`,
+           `Available Globally?`, 
+           live_event) |>
+    rename(
+      title = Title,
+      runtime = Runtime,
+      views = Views,
+      hours_viewed = 'Hours Viewed',
+      release_date = 'Release Date',
+      available_globally = 'Available Globally?',
+    ) |>
+  mutate(
+    year = as.integer(year),
+    available_globally = available_globally == "Yes"
+  )
+}
+
+NETFLIX_DATA <- load_netflix_data()
+```
+
+
+## Initial Data Exploration
+```{r}
+glimpse(NETFLIX_DATA)
+skim(NETFLIX_DATA)
+```
+From the `glimpse()` output, we can glean that the dataset contains 61,892 records across 11 variables.  It also provides a couple of important checks on some of the small changes we made in Task 3.  First, it validates that we successfully changed the data types for `year` and `available_globally`; `year` is now an integer and `available_globally` is now a logical variable.  Second, it confirms that we successfully changed the variable names for `title`, `runtime`, `views`, `hours_viewed`, `release_date`, and `available_globally`.  
+
+It also raises an important flag.  The `NA` values displayed for the `views` variable warrant a more detailed look at its records.  Had the assignment not explicitly noted the data limitations associated with the the `views` variable, it would be prudent to verify whether all records under `views` were missing, or whether the `NA` values were limited to the small number of records given in the `glimpse()` output.  
+
+The `skim()` output fills in that information gap.  It shows that only 18,198 of the `views` records have missing values, or a little less than 30 percent of all records.  It also raises a second significant missing values flag not apparent from the `glimpse()` output, which is that the `runtime` column contains about 13,085 records with missing values, or a little more than 20 percent of all records.
+
+
+## Exploratory Questions - Inline Values
+1)
+```{r}
+date_range <- NETFLIX_DATA |>
+  summarise(
+    start_date = min(period_start),
+    end_date = max(period_end)
+  )
+```
+The Netflix data cover the period from `r format(date_range$start_date, "%B %d, %Y")` through `r format(date_range$end_date, "%B %d, %Y")`.
+
+2)
+```{r}
+title_count <- NETFLIX_DATA |>
+  summarise(
+    unique_titles = n_distinct(title)
+  )
+```
+The dataset contains `r scales::comma(title_count$unique_titles)` distinct shows and movies.
+
+3)
+```{r}
+bridgerton_hours <- NETFLIX_DATA |>
+  filter(str_detect(title, "Bridgerton")) |>
+  summarise(
+    total_hours = sum(hours_viewed)
+  )
+```
+Titles in the Bridgerton universe accounted for `r scales::comma (bridgerton_hours$total_hours)` total hours viewed.
+  
+4)
+```{r}
+stranger_things_hours <- NETFLIX_DATA |>
+  filter(str_detect(title, "Stranger Things")) |>
+  filter_out(str_detect(title, "Beyond Stranger Things")) |>
+  filter_out(str_detect(title, "Tales from")) |>
+  filter_out(str_detect(title, "Fireplace")) |>
+  summarise(
+    total_hours = sum(hours_viewed)
+  )
+```
+The five seasons of Stranger Things, without any companion titles related to Stranger Things, accounted for `r scales::comma(stranger_things_hours$total_hours)` total hours viewed.
+
+5)
+```{r}
+top10_share <- NETFLIX_DATA |>
+  filter(period == "2026H1") |>
+  arrange(desc(hours_viewed)) |>
+  mutate(rank = row_number()) |>
+  summarise(
+    total_hours = sum(hours_viewed),
+    top10_hours = sum(hours_viewed[rank <= 10]),
+    share = top10_hours / total_hours
+  )
+```
+The Top 10 titles in 2026H1 accounted for a proportion of `r top10_share$share` of total hours viewed. 
+
+6)
+```{r}
+global_availability <- NETFLIX_DATA |>
+  summarize(
+    share_titles = mean(available_globally, na.rm = TRUE),
+    share_hours = sum(hours_viewed[available_globally == TRUE], na.rm = TRUE) / sum(hours_viewed, na.rm = TRUE)
+  )
+```
+Content made available to global audiences represents `r scales::percent(global_availability$share_titles, accuracy = 0.1)` of all Netflix catalog entries, accounting for `r scales::percent(global_availability$share_hours, accuracy = 0.1)` of total hours viewed. 
+
+## Exploratory Questions - Table Answers
+1) Key Takeaway: Series-based content consistently occupies the number one spot in every reporting period in terms of viewership hours and share of total viewing.
+```{r}
+top_show_by_period <- NETFLIX_DATA |>
+  group_by(period, title) |>
+  summarise(
+    show_hours = sum(hours_viewed, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  group_by(period) |>
+  mutate(
+    period_hours = sum(show_hours),
+    viewership_share = show_hours / period_hours
+  )|>
+  slice_max(
+    order_by = show_hours,
+    n=1,
+    with_ties = FALSE
+  )|>
+  ungroup() |>
+  select(
+    period,
+    title,
+    show_hours,
+    viewership_share
+  )
+top_show_by_period|>
+  gt() |>
+  cols_label(
+    period = "Period",
+    title = "Top Title",
+    show_hours = "Hours Viewed",
+    viewership_share = "Table 1: Share of Total Viewership"
+  )|>
+  fmt_number(
+    column = show_hours,
+    decimals = 0,
+    use_seps = TRUE
+  )|>
+  fmt_percent(
+    columns = viewership_share,
+    decimals = 1
+  )|>
+  tab_header(
+    title = "Table 1: Top Netflix Title by Reporting Period"
+  )
+```
+
+2) Key Takeaway: Over the period being evaluated, both the number of titles and total runtime hours move through time largely in lockstep with one another. 
+```{r}
+catalog_size <- NETFLIX_DATA|>
+  group_by(period) |>
+  summarise(
+    number_of_titles = n_distinct(title),
+    total_runtime_hours = sum(runtime, na.rm = TRUE) / 60,
+    .groups = "drop"
+  )
+
+catalog_size |>
+  gt() |>
+  cols_label(
+    period = "Period",
+    number_of_titles = "Number of Titles",
+    total_runtime_hours = "Total Runtime (Hours)"
+  )|>
+  fmt_number(
+    columns = c(number_of_titles,total_runtime_hours),
+    decimals = 0,
+    use_seps = TRUE
+  )|>
+  tab_header(
+    title = "Table 2: Netflix Catalog Size by Reporting Period"
+  )
+```
+
+3) Key Takeaway: Substantial viewer interest can continue in a very meaningful way well beyond a title’s initial release.
+```{r}
+consistent_titles <- NETFLIX_DATA |>
+  group_by(title) |>
+  summarise(
+    periods_present = n_distinct(period),
+    average_hours = mean(hours_viewed, na.rm = TRUE),
+    minimum_hours = min(hours_viewed, na.rm = TRUE),
+    sd_hours = sd(hours_viewed, na.rm = TRUE),
+    .groups = "drop"
+  )|>
+  filter(
+    periods_present == n_distinct(NETFLIX_DATA$period)
+  )|>
+  arrange(desc(minimum_hours)) |>
+  slice_head(n=10)
+
+consistent_titles |>
+  select(
+    title,
+    minimum_hours,
+    average_hours,
+    sd_hours
+  )|>
+  gt() |>
+  cols_label(
+    title = "Title",
+    minimum_hours = "Minimum Hours Viewed",
+    average_hours = "Average Hours Viewed",
+    sd_hours = "Standard Deviation"
+  )|>
+  fmt_number(
+    columns = c(average_hours, minimum_hours, sd_hours),
+    decimals = 0,
+    use_seps = TRUE
+  )|>
+  tab_header(
+    title = "Table 3: Titles with the Highest Minimum Hours Viewed Across Periods"
+  )
+```
+
+4) Key Takeaway: Movies and live events occupy a substantially smaller, but consistent, share of total viewing hours, filling an important niche of the content landscape as complementary offerings. 
+```{r}
+classified_netflix <- NETFLIX_DATA |>
+  mutate(
+    content_type = case_when(
+      live_event == TRUE ~ "live_event",
+      str_detect(
+        title,
+        regex("//bSeason | Limited Series", ignore_case = TRUE)
+      ) ~ "Show",
+      !is.na(runtime) & runtime > 240 ~ "Show",
+      !is.na(runtime) & runtime <= 240 ~ "Movie",
+      TRUE ~ "Unclassified"
+    )
+  )
+
+shows_vs_movies <- classified_netflix |>
+  group_by(period, content_type) |>
+  summarise(
+    hours_viewed = sum(hours_viewed, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  group_by(period) |>
+  mutate(
+    share_of_viewing = hours_viewed / sum(hours_viewed)
+  ) |>
+  ungroup()
+
+shows_vs_movies_table <- shows_vs_movies |>
+  select(period,content_type,share_of_viewing) |>
+  pivot_wider(
+    names_from = content_type,
+    values_from = share_of_viewing,
+    values_fill = 0
+  )
+
+shows_vs_movies_table |>
+  gt() |>
+  cols_label(
+    period = "Period",
+    Movie = "Movies",
+    Show = "Shows",
+    live_event = "Live Events",
+    Unclassified = "Unclassified"
+  ) |>
+  fmt_percent(
+    columns = c(Movie, Show, live_event, Unclassified),
+    decimals = 1
+  ) |>
+  tab_header(
+    title = "Table 4: Proportion of Netflix Viewing Hours by Content Type"
+  )
+```
+
+5) Key Takeaway: While viewers spend substantially more time engaged with pre-taped content, live events still average more than one-third as many viewing hours across the period being evaluated. 
+```{r}
+live_periods <- NETFLIX_DATA |>
+  filter(live_event == TRUE) |>
+  distinct(period) |>
+  pull(period)
+
+live_comparison <- NETFLIX_DATA |>
+  filter(period %in% live_periods) |>
+  mutate(
+    content_type = if_else(live_event, "Live Event", "Pre-Taped")
+  )|>
+  group_by(content_type) |>
+  mutate(
+    top_tier_cutoff = quantile(hours_viewed, 0.90, na.rm = TRUE)
+  )|>
+  summarise(
+    average_hours = mean(hours_viewed, na.rm = TRUE),
+    top_tier_average_hours = mean(hours_viewed[hours_viewed >= top_tier_cutoff], na.rm = TRUE),
+    .groups = "drop"
+  )
+
+live_comparison |>
+  gt() |>
+  cols_label(
+    content_type = "Content Type",
+    average_hours = "Average Hours Viewed",
+    top_tier_average_hours = "Top 10% Average Hours Viewed"
+  ) |>
+  fmt_number(
+    columns = c(average_hours, top_tier_average_hours),
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  tab_header(
+    title = "Table 5: Viewing Performance of Live Events vs. Pre-Taped Content"
+  )
+```
+
+## Corporate Strategy Memo on Netflix Original Content 
+Based on the preceding analysis, I recommend a continued prioritization of series-based original content to global audiences, with a specific focus on established series demonstrating an ability to maintain viewer engagement across seasons.  The clearest indicator of the popularity of this type of content is reflected in the fact that series-based content accounted for 88.5 percent to 89.1 percent of total viewing hours between the second half of 2023 and the first half of 2026.  The analysis also suggests that casting a wider net over global audiences can meaningfully expand the viewing reach of this type of content.  Considering the role of movies and live events on the platform, although these content types account for a substantially lower share of viewing hours in general, I would not suggest eliminating these types of content from the Netflix lineup. Instead, they should be thoughtfully curated as complementary offerings to provide the variety that allows Netflix to appeal to a broader range of viewers and bring them onto its platform.
+
+Digging deeper into the prioritization of series-based content, several other indicators presented in the preceding analysis provide insight into the types of series that have proven to be most popular among Netflix viewers.  It’s not enough to merely host series-based content that fizzles out after the first season or two.  To make this point clearer, the table below outlines the titles with the highest minimum hours viewed from the second half of 2023 and the first half of 2026.  
+```{r}
+#| echo: false
+consistent_titles <- NETFLIX_DATA |>
+  group_by(title) |>
+  summarise(
+    periods_present = n_distinct(period),
+    average_hours = mean(hours_viewed, na.rm = TRUE),
+    minimum_hours = min(hours_viewed, na.rm = TRUE),
+    sd_hours = sd(hours_viewed, na.rm = TRUE),
+    .groups = "drop"
+  )|>
+  filter(
+    periods_present == n_distinct(NETFLIX_DATA$period)
+  )|>
+  arrange(desc(minimum_hours)) |>
+  slice_head(n=10)
+
+consistent_titles |>
+  select(
+    title,
+    minimum_hours,
+    average_hours,
+    sd_hours
+  )|>
+  gt() |>
+  cols_label(
+    title = "Title",
+    minimum_hours = "Minimum Hours Viewed",
+    average_hours = "Average Hours Viewed",
+    sd_hours = "Standard Deviation"
+  )|>
+  fmt_number(
+    columns = c(average_hours, minimum_hours, sd_hours),
+    decimals = 0,
+    use_seps = TRUE
+  )|>
+  tab_header(
+    title = "Titles with the Highest Minimum Hours Viewed Across Periods"
+  )
+```
+Every title included in the table was released prior to the period being evaluated, indicating that substantial viewer interest can continue in a very meaningful way well beyond a title’s initial release.  Whether viewers returned to the fourth season of Stranger Things for a recap ahead of its final season, or took a walk down memory lane with some old seasons of Breaking Bad or Suits, one thing remains clear: quality series-based content carries a legacy that draws viewers back time and again. 
+
+Beyond prioritizing quality series-based content, Netflix should also continue expanding its content to global audiences.  The evidence is compelling that content available across geographic markets accounts for a disproportionately large share of total viewing hours.  Between 2023 and 2026, those 35.1 percent of Netflix catalog records accounted for just under 52 percent of total hours viewed.  
+```{r}
+#| echo: false
+
+global_dumbbell <- tibble(
+  measure = "Globally Available Content",
+  catalog_share = global_availability$share_titles,
+  viewing_share = global_availability$share_hours
+)
+
+ggplot(global_dumbbell, aes(y = measure)) +
+  geom_segment(
+    aes(
+      x = catalog_share,
+      xend = viewing_share,
+      yend = measure
+    ),
+    linewidth = 2
+  ) +
+  geom_point(
+    aes(x = catalog_share),
+    size = 6
+  ) +
+  geom_point(
+    aes(x = viewing_share),
+    size = 6
+  ) +
+  geom_text(
+    aes(
+      x = catalog_share,
+      label = paste0(
+        "Catalog Records\n",
+        scales::percent(catalog_share, accuracy = 0.1)
+      )
+    ),
+    nudge_y = 0.15,
+    size = 4
+  ) +
+  geom_text(
+    aes(
+      x = viewing_share,
+      label = paste0(
+        "Viewing Hours\n",
+        scales::percent(viewing_share, accuracy = 0.1)
+      )
+    ),
+    nudge_y = 0.15,
+    size = 4
+  ) +
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    limits = c(0, 0.60)
+  ) +
+  labs(
+    title = "Global Share of Netflix Catalog Records and Viewing Hours",
+    subtitle = "Globally available content as a share of aggregate catalog records and aggregate viewing hours,\n2023–2026",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.grid.major.y = element_blank()
+  )
+```
+This suggests that expanding the global availability of Netflix content may provide a meaningful opportunity for the company to increase overall engagement and the total number of hours spent on its platform. 
+
+As it relates to complementary offerings, it should be noted that although live events and movies comprise a meaningfully smaller share of the Netflix content viewership, I would not altogether recommend eliminating or even reducing their presence on the platform.  Together, these complementary offerings account for roughly 7 to 9 percent of total viewing hours in the more complete reporting periods provided in the data.  
+```{r}
+#| echo: false
+content_mix_viz <- shows_vs_movies |>
+  filter(period != "2023H1") |>
+  mutate(
+    content_group = case_when(
+      content_type == "Show" ~ "Series-Based Content",
+      content_type %in% c("Movie", "Live Event") ~ "Complementary Offerings",
+      content_type == "Unclassified" ~ "Unclassified"
+    )
+  ) |>
+  group_by(period, content_group) |>
+  summarise(
+    share_of_viewing = sum(share_of_viewing),
+    .groups = "drop"
+  )
+
+ggplot(
+  content_mix_viz,
+  aes(
+    x = period,
+    y = share_of_viewing,
+    fill = content_group
+  )
+) +
+  geom_col(position = "fill") +
+  scale_fill_manual(
+    values = c(
+      "Series-Based Content" = "#A7C7E7",
+      "Complementary Offerings" = "#F6C6A8",
+      "Unclassified" = "#D9D9D9"
+    )
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  labs(
+  title = "Netflix Viewing Hours by Content Type",
+  subtitle = "Series-based content compared with complementary offerings,\n 2023H2–2026H1",
+  x = NULL,
+  y = NULL,
+  fill = NULL,
+  caption = "**Note**: Unclassified content reflects records with insufficient information to<br>distinguish between movies/live events and series, primarily due to<br>missing runtime data."
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.caption = ggtext::element_markdown(
+      size = 10,
+      hjust = 0
+    )
+  )
+```
+Although these figures are dwarfed by the comparable figures for series-based content, live events and movies can serve a broader strategic purpose beyond viewing-hour performance or other measurable metrics.  These types of content may help Netflix appeal to viewers seeking event-driven or lower-commitment viewing experiences in a way that may broaden Netflix’s audience over time.  
+
+To summarize, I suggest that Netflix continue its acquisition of quality series-based content made available to a global audience while curating a thoughtful canon of complements available to its users.
+
+::: {.callout-note title="AI Usage Statement" collapse="true"}
+
+Much of the coding work, although conceptually familiar to me from the lectures and general practice from pre-assignments, caused more than a few technical holdups over the course of the assignment.  I tried to fix as many of the errors as I could on my own at first, but soon realized the limitation of being new to r programming and lacking a strong enough eye to find where a pip symbol may be missing / incorrectly typed or where a matching parenthesis might have been accidentally deleted.  For this purpose, I used ChatGPT as a support to help me catch and remediate technical issues I encountered, and to provide a plain language summary of what the error messages meant.  
+
+I encountered a number of growing pains as it related to data-manipulation in Task 6.  In these cases, I employed ChatGPT to help rewrite parts of code that were not working, and to provide a summary explaining why.  Most of the data manipulation snags ended being very easy fixes, for example forgetting to place a group_by function ahead of summarize or forgetting to use == instead of = in a mutate function.  
+
+Over the course of the assignment, I created over 20 new variables and renamed many of them when creating tables.  Again, ChatGPT was very helpful in pointing out when a variable or label was inconsistent with prior lines of code.  
+
+Finally, I leaned on ChatGPT to help me write the programming blocks that created the data visualizations in my write-up for Task 7.    
+
+    
+
+:::
+
+
