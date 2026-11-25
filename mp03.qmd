@@ -1,7 +1,1307 @@
+---
+title: "From Washington Heights to the Rest of America: Mapping Dominican Communities"
+subtitle: "STA 9750 · Mini-Project #03"
+author: "Andrew Wilber"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    code-summary: "Show R code"
+    code-tools: true
+    theme: cosmo
+    number-sections: false
+execute:
+  warning: false
+  message: false
+---
 
-  ---
-  title: "Mini-Project Placeholder"
-  ---
+# Introduction
+
+Washington Heights has long been recognized as a center of Dominican culture in New York City. As a resident of the neighborhood, I have a personal interest in understanding the geographic concentration of Dominican Americans, both within New York City and throughout the United States. This project explores where Dominican communities have established themselves, how their populations vary across metropolitan areas, and what distinguishes their presence in different parts of the country.
+
+The analysis draws on data from the American Community Survey (ACS), New York City's Neighborhood Tabulation Areas (NTAs), and the Primary Land Use Tax Output (PLUTO) database. Together, these data provide a basis for examining where Dominican Americans are concentrated across the United States and exploring how population density, housing, and neighborhood characteristics vary throughout New York City.
+
+# Data acquisition and methods
+
+## Task 0: Census API Access
+
+Population estimates were obtained from the U.S. Census Bureau through the American Community Survey (ACS), using the `tidycensus` package in R. Access to the Census API was configured through a locally stored API key, allowing the data to be retrieved without exposing credentials in the project code.
+
+The analysis uses the **2025 ACS 1-year estimates** for metropolitan areas and states, and the **2020–2024 ACS 5-year estimates** for New York City census tracts. The five-year estimates provide the geographic detail necessary to examine population patterns at the neighborhood level.
+
+| Concept | Census variable |
+|---|---|
+| Total population | `B01003_001` |
+| Dominican origin | `B03001_007` |
+
+ACS figures are survey-based estimates rather than exact population counts. The different reporting periods should therefore be considered when interpreting comparisons across geographic levels.
+
+```{r}
+#| label: setup
+#| include: false
+
+library(dplyr)
+library(ggplot2)
+library(gt)
+library(readr)
+library(scales)
+library(tidycensus)
+library(tidyr)
+library(sf)
+library(httr2)
+
+ACS1_YEAR <- 2025L
+ACS5_YEAR <- 2024L
+DATA_DIR <- "data/mp03"
+
+dir.create(DATA_DIR, showWarnings = FALSE, recursive = TRUE)
+```
+## Task 1: CBSA population and Dominican origin
+Core-based statistical areas (CBSAs) include metropolitan and micropolitan areas, encompassing urban centers and surrounding counties connected through commuting patterns.
+
+The CBSA data were retrieved using a function that checks for an existing local file before downloading new estimates. The function retrieves both population estimates and margins of error and organizes the results into one row per CBSA, with separate columns for total population and Dominican-origin population.
+
+```{r}
+#| label: cbsa-download
+
+load_cbsa_dominican <- function(
+    year = ACS1_YEAR,
+    data_dir = DATA_DIR
+) {
+  dir.create(data_dir, recursive = TRUE, showWarnings = FALSE)
+
+  cache_path <- file.path(
+    data_dir,
+    paste0("acs1_", year, "_cbsa_dominican.csv")
+  )
+
+  if (!file.exists(cache_path) || file.info(cache_path)$size == 0) {
+    # Retrieve Census API credentials from the local environment.
+    if (!nzchar(Sys.getenv("CENSUS_API_KEY"))) {
+      stop(
+        "No Census API key found. Run census_api_key(..., install=TRUE) ",
+        "in the R Console, restart R, and render again."
+      )
+    }
+
+    acs_raw <- tidycensus::get_acs(
+      geography = "cbsa",
+      variables = c(
+        total_population = "B01003_001",
+        dominican_population = "B03001_007"
+      ),
+      year = year,
+      survey = "acs1",
+      output = "tidy",
+      geometry = FALSE,
+      cache_table = TRUE
+    )
+
+    cbsa_wide <- acs_raw |>
+      select(GEOID, NAME, variable, estimate, moe) |>
+      pivot_wider(
+        names_from = variable,
+        values_from = c(estimate, moe),
+        names_glue = "{variable}_{.value}"
+      )
+
+    # Save results for faster subsequent renders and responsible API use.
+    readr::write_csv(cbsa_wide, cache_path)
+  }
+
+  # Keep the geographic identifier as character data.
+  readr::read_csv(
+    cache_path,
+    col_types = readr::cols(
+      GEOID = readr::col_character(),
+      .default = readr::col_guess()
+    ),
+    show_col_types = FALSE
+  )
+}
+
+cbsa_population <- load_cbsa_dominican() |>
+  filter(
+    !is.na(total_population_estimate),
+    total_population_estimate > 0,
+    !is.na(dominican_population_estimate),
+    dominican_population_estimate >= 0
+  ) |>
+  mutate(
+    dominican_share = dominican_population_estimate /
+      total_population_estimate
+  )
+
+# There should be one unique record per CBSA.
+stopifnot(nrow(cbsa_population) > 0)
+stopifnot(!anyDuplicated(cbsa_population$GEOID))
+```
+
+### First look: largest Dominican-origin populations by CBSA
+
+The following table ranks CBSAs by the **estimated count** of residents reporting Dominican origin, rather than by population share. These are two different ways of describing a community's geographic concentration.
+
+```{r}
+#| label: cbsa-top-counts
+
+cbsa_population |>
+  arrange(desc(dominican_population_estimate)) |>
+  slice_head(n = 10) |>
+  select(
+    metro_area = NAME,
+    dominican_population_estimate,
+    total_population_estimate,
+    dominican_share
+  ) |>
+  gt() |>
+  tab_header(
+    title = "CBSAs with the largest estimated Dominican-origin populations",
+    subtitle = "2025 American Community Survey, 1-year estimates"
+  ) |>
+  cols_label(
+    metro_area = "Core-based statistical area",
+    dominican_population_estimate = "Dominican-origin residents",
+    total_population_estimate = "Total population",
+    dominican_share = "Dominican-origin share"
+  ) |>
+  fmt_number(
+    columns = c(dominican_population_estimate, total_population_estimate),
+    decimals = 0
+  ) |>
+  fmt_percent(columns = dominican_share, decimals = 2) |>
+  tab_source_note(
+    source_note = "Source: U.S. Census Bureau, 2025 ACS 1-year, tables B03001 and B01003. Estimates are subject to sampling uncertainty."
+  )
+```
+
+### Initial visualization
+
+```{r}
+#| label: cbsa-top-counts-plot
+#| fig-width: 9
+#| fig-height: 6
+#| fig-cap: "Estimated Dominican-origin population in the ten CBSAs with the largest counts (2025 ACS 1-year)."
+
+cbsa_population |>
+  slice_max(dominican_population_estimate, n = 10, with_ties = FALSE) |>
+  ggplot(
+    aes(
+      x = reorder(NAME, dominican_population_estimate),
+      y = dominican_population_estimate
+    )
+  ) +
+  geom_col(fill = "#203F60", width = 0.75) +
+  coord_flip() +
+  scale_x_discrete(
+    labels = function(x) vapply(
+      x,
+      function(label) paste(strwrap(label, width = 42), collapse = "\n"),
+      character(1)
+    )
+  ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    title = "Where are the largest Dominican-origin communities?",
+    subtitle = "Ranked by population count, not percentage of residents",
+    x = NULL,
+    y = "Estimated Dominican-origin residents",
+    caption = "Source: U.S. Census Bureau, 2025 ACS 1-year (B03001_007)."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    plot.title.position = "plot"
+  )
+```
+
+## Task 2: NYC census tract population estimates
+
+The 2024 ACS five-year survey provides the geographic detail needed to examine individual census tracts. The five boroughs correspond to Bronx, Kings, New York, Queens, and Richmond counties. A GeoPackage retains tract boundaries in a cached local file.
+
+```{r}
+#| label: task2-nyc-tract-download
+
+load_nyc_tracts <- function(year = ACS5_YEAR, data_dir = DATA_DIR) {
+  dir.create(data_dir, recursive = TRUE, showWarnings = FALSE)
+  cache_path <- file.path(data_dir, paste0("nyc_tracts_acs5_", year, ".gpkg"))
+
+  if (!file.exists(cache_path)) {
+    tracts <- tidycensus::get_acs(
+      geography = "tract",
+      variables = c(
+        total_population = "B01003_001",
+        dominican_population = "B03001_007"
+      ),
+      state = "NY",
+      county = c("Bronx", "Kings", "New York", "Queens", "Richmond"),
+      year = year,
+      survey = "acs5",
+      geometry = TRUE,
+      output = "wide",
+      cache_table = TRUE
+    )
+
+    sf::st_write(tracts, cache_path, quiet = TRUE)
+  }
+
+  sf::st_read(cache_path, quiet = TRUE)
+}
+
+nyc_tracts <- load_nyc_tracts() |>
+  mutate(
+    tract_population = total_populationE,
+    tract_dominican = dominican_populationE,
+    tract_dominican_share = if_else(
+      tract_population > 0, tract_dominican / tract_population, NA_real_
+    )
+  )
+
+stopifnot(nrow(nyc_tracts) > 1000)
+stopifnot(!anyDuplicated(nyc_tracts$GEOID))
+```
+
+## Task 3: Download NYC's 2020 NTAs
+
+The NYC Department of City Planning publishes 2020 NTA boundaries through NYC Open Data. This is a **direct shapefile download**. Cached ZIP and unzipped files prevent repeated requests. The downloaded NTA attributes include `NTA2020`, `NTAName` and `BoroName`.
+
+```{r}
+#| label: task3-nta-download
+
+load_nyc_nta <- function(data_dir = DATA_DIR) {
+  dir.create(data_dir, recursive = TRUE, showWarnings = FALSE)
+  zip_path <- file.path(data_dir, "nyc_nta_2020.zip")
+  unzip_dir <- file.path(data_dir, "nyc_nta_2020_shapefile")
+  nta_url <- paste0(
+    "https://data.cityofnewyork.us/api/geospatial/9nt8-h7nd",
+    "?method=export&format=Shapefile"
+  )
+
+  if (!file.exists(zip_path) || file.info(zip_path)$size == 0) {
+    download.file(nta_url, destfile = zip_path, mode = "wb", quiet = TRUE)
+  }
+
+  if (!dir.exists(unzip_dir) ||
+      length(list.files(unzip_dir, pattern = "[.]shp$", recursive = TRUE)) == 0) {
+    dir.create(unzip_dir, showWarnings = FALSE, recursive = TRUE)
+    unzip(zip_path, exdir = unzip_dir)
+  }
+
+  shp_files <- list.files(
+    unzip_dir, pattern = "[.]shp$", full.names = TRUE, recursive = TRUE
+  )
+  stopifnot(length(shp_files) >= 1)
+
+  nta <- sf::st_read(shp_files[1], quiet = TRUE)
+
+  # Normalize field names (different shapefile versions can vary in capitalization).
+  names(nta) <- tolower(names(nta))
+  stopifnot(all(c("nta2020", "ntaname") %in% names(nta)))
+  nta |>
+    select(nta2020, ntaname, any_of(c("boroname", "ntatype")))
+}
+
+nyc_nta <- load_nyc_nta()
+stopifnot(nrow(nyc_nta) > 200)
+```
+
+## Task 4: Aggregate tract population to the NTA level
+
+A census tract may overlap multiple NTAs, so `largest = TRUE` assigns it to the NTA with which it has the greatest geographic intersection. This is a reasonable approximation but not an exact boundary-based population allocation. The resulting tract-to-NTA assignments were subsequently used to summarize PLUTO housing characteristics by neighborhood.
+
+```{r}
+#| label: task4-tract-to-nta
+
+nta_for_join <- nyc_nta |>
+  st_transform(st_crs(nyc_tracts)) |>
+  select(nta2020, ntaname)
+
+tracts_with_nta <- nyc_tracts |>
+  sf::st_join(
+    nta_for_join,
+    join = sf::st_intersects,
+    largest = TRUE,
+    left = TRUE
+  )
+
+stopifnot(nrow(tracts_with_nta) == nrow(nyc_tracts))
+
+tract_nta_key <- tracts_with_nta |>
+  sf::st_drop_geometry() |>
+  select(GEOID, nta2020, ntaname)
+
+nta_summaries <- tracts_with_nta |>
+  sf::st_drop_geometry() |>
+  filter(!is.na(nta2020)) |>
+  group_by(nta2020) |>
+  summarise(
+    nta_population = sum(tract_population, na.rm = TRUE),
+    nta_dominican = sum(tract_dominican, na.rm = TRUE),
+    tract_count = n(),
+    .groups = "drop"
+  ) |>
+  mutate(
+    nta_dominican_share = if_else(
+      nta_population > 0, nta_dominican / nta_population, NA_real_
+    )
+  )
+
+nta_population_map <- nyc_nta |>
+  left_join(nta_summaries, by = "nta2020")
+```
+
+## Task 5: Download PLUTO in pages and cache locally
+
+NYC's PLUTO dataset is accessed through its public Socrata SODA2 CSV endpoint. The function requests 10,000 records per page with `$limit` and `$offset`; the ordered pages are combined with `bind_rows()`, then saved as CSV. Only fields needed for the questions are retrieved.
+
+```{r}
+#| label: task5-pluto-download
+
+load_pluto <- function(data_dir = DATA_DIR, page_size = 10000L) {
+  dir.create(data_dir, recursive = TRUE, showWarnings = FALSE)
+  cache_path <- file.path(data_dir, "pluto_2026_selected_columns.csv")
+
+  if (file.exists(cache_path) && file.info(cache_path)$size > 0) {
+    return(readr::read_csv(
+      cache_path,
+      col_types = cols(bct2020 = col_character(), .default = col_guess()),
+      show_col_types = FALSE
+    ))
+  }
+
+  endpoint <- "https://data.cityofnewyork.us/resource/64uk-42ks.csv"
+  fields <- c(
+    "bbl", "borough", "bct2020", "unitsres", "resarea",
+    "officearea", "comarea", "numfloors", "landuse"
+  )
+
+  pages <- list()
+  offset <- 0L
+  page_number <- 1L
+
+  repeat {
+    request <- httr2::request(endpoint) |>
+      httr2::req_url_query(
+        "$select" = paste(fields, collapse = ","),
+        "$order" = "bbl",
+        "$limit" = page_size,
+        "$offset" = offset
+      ) |>
+      httr2::req_retry(max_tries = 3)
+
+    response <- httr2::req_perform(request)
+    page <- readr::read_csv(
+      I(httr2::resp_body_string(response)),
+      col_types = cols(bct2020 = col_character(), .default = col_guess()),
+      show_col_types = FALSE
+    )
+
+    pages[[page_number]] <- page
+    message("PLUTO page ", page_number, ": ", nrow(page), " records")
+
+    if (nrow(page) < page_size) break
+    offset <- offset + page_size
+    page_number <- page_number + 1L
+  }
+
+  pluto <- dplyr::bind_rows(pages)
+  stopifnot(nrow(pluto) > 800000)
+  stopifnot(!anyDuplicated(pluto$bbl))
+  readr::write_csv(pluto, cache_path)
+  pluto
+}
+
+pluto <- load_pluto()
+```
+
+### Align PLUTO's 2020 tract code with Census tract GEOIDs
+
+A Census `GEOID` consists of state FIPS (2 digits), county FIPS (3 digits), and tract code (6 digits). PLUTO's `bct2020` contains a one-digit borough code followed by a six-digit tract code. The conversion below lets the PLUTO and ACS tables be joined by `GEOID`.
+
+```{r}
+#| label: pluto-tract-aggregation
+
+
+pluto_tracts <- pluto |>
+  mutate(
+    numfloors = if_else(
+      as.character(bbl) == "3053460017",
+      NA_real_,
+      numfloors
+    ),
+    bct2020 = as.character(bct2020),
+
+    borough_digit = substr(bct2020, 1, 1),
+    county_fips = case_when(
+      borough_digit == "1" ~ "061", # Manhattan / New York County
+      borough_digit == "2" ~ "005", # Bronx
+      borough_digit == "3" ~ "047", # Brooklyn / Kings
+      borough_digit == "4" ~ "081", # Queens
+      borough_digit == "5" ~ "085", # Staten Island / Richmond
+      TRUE ~ NA_character_
+    ),
+    GEOID = if_else(
+      !is.na(county_fips) & nchar(bct2020) == 7,
+      paste0("36", county_fips, substr(bct2020, 2, 7)),
+      NA_character_
+    )
+  ) |>
+  filter(!is.na(GEOID)) |>
+  group_by(GEOID) |>
+  summarise(
+    residential_units = sum(unitsres, na.rm = TRUE),
+    residential_sqft = sum(resarea, na.rm = TRUE),
+    office_sqft = sum(officearea, na.rm = TRUE),
+    commercial_sqft = sum(comarea, na.rm = TRUE),
+    tallest_lot_floors = if (all(is.na(numfloors))) NA_real_
+      else max(numfloors, na.rm = TRUE),
+    lot_count = n(),
+    .groups = "drop"
+  )
+
+
+tract_analysis <- tracts_with_nta |>
+  left_join(pluto_tracts, by = "GEOID")
+
+# Calculate tract area using the spatial geometry.
+tract_analysis$tract_area_sqkm <- as.numeric(
+  units::set_units(sf::st_area(tract_analysis), "km^2")
+)
+
+# Calculate population and housing density measures.
+tract_analysis <- tract_analysis |>
+  mutate(
+    residents_per_residential_sqft = if_else(
+      residential_sqft > 0,
+      tract_population / residential_sqft,
+      NA_real_
+    ),
+    residents_per_unit = if_else(
+      residential_units > 0,
+      tract_population / residential_units,
+      NA_real_
+    ),
+    residents_per_sqkm = if_else(
+      tract_area_sqkm > 0,
+      tract_population / tract_area_sqkm,
+      NA_real_
+    )
+  )
+
+# Verify matching quality.
+message(
+  "PLUTO matching tracts: ",
+  sum(!is.na(tract_analysis$residential_units)),
+  " of ",
+  nrow(tract_analysis)
+)
+
+```
+
+# Task 6: Required exploratory analysis
+
+## Q1. Which census tract has the most office floor area?
+
+```{r}
+#| label: task6-q1
+q1 <- tract_analysis |>
+  sf::st_drop_geometry() |>
+  arrange(desc(office_sqft)) |>
+  select(GEOID, NAME, office_sqft) |>
+  slice_head(n = 5)
+
+knitr::kable(
+  q1,
+  caption = "NYC Census Tracts with the Largest Office Floor Area",
+  col.names = c("Census Tract GEOID", "Census Tract", "Office Area (sq. ft.)"),
+  format.args = list(big.mark = ",", scientific = FALSE)
+)
+
+```
+The five census tracts with the greatest office floor area are all located in Manhattan, reflecting the borough's concentration of commercial development.
+
+## Q2. Which NTA has the most residential units?
+
+```{r}
+#| label: task6-q2
+nta_housing <- tract_analysis |>
+  sf::st_drop_geometry() |>
+  filter(!is.na(nta2020)) |>
+  group_by(nta2020, ntaname) |>
+  summarise(residential_units = sum(residential_units, na.rm = TRUE),
+            .groups = "drop") |>
+  arrange(desc(residential_units))
+
+
+nta_housing |>
+  slice_head(n = 5) |>
+  knitr::kable(
+    caption = "NYC Neighborhoods with the Most Residential Units",
+    col.names = c(
+      "NTA Code",
+      "Neighborhood",
+      "Residential Units"
+    ),
+    format.args = list(
+      big.mark = ",",
+      scientific = FALSE
+    )
+  )
+
+
+```
+
+Notably, all five of the highest-ranking NTAs are located in Manhattan, reflecting the borough's concentration of large residential buildings and high-density development. Because PLUTO records were aggregated to census tracts and subsequently assigned to NTAs, these neighborhood totals should be interpreted as approximate.
+
+## Q3. Highest population per square foot and per residential unit
+
+```{r}
+#| label: task6-q3
+q3_by_area <- tract_analysis |>
+  sf::st_drop_geometry() |>
+  filter(is.finite(residents_per_residential_sqft)) |>
+  slice_max(residents_per_residential_sqft, n = 5, with_ties = FALSE) |>
+  select(GEOID, NAME, residents_per_residential_sqft,
+         tract_population, residential_sqft)
+
+q3_by_unit <- tract_analysis |>
+  sf::st_drop_geometry() |>
+  filter(is.finite(residents_per_unit)) |>
+  slice_max(residents_per_unit, n = 5, with_ties = FALSE) |>
+  select(GEOID, NAME, residents_per_unit, tract_population, residential_units)
+
+knitr::kable(q3_by_area, caption = "Highest residents per residential square foot")
+knitr::kable(q3_by_unit, caption = "Highest residents per residential unit")
+
+#| label: task6-q3-sensitivity
+
+# Exclude tracts with 100 or fewer residential units.
+q3_sensitivity <- tract_analysis |>
+  sf::st_drop_geometry() |>
+  filter(residential_units > 100)
+
+# Identify the leading tract under each density measure.
+q3_sensitivity_results <- dplyr::bind_rows(
+  q3_sensitivity |>
+    filter(is.finite(residents_per_unit)) |>
+    slice_max(residents_per_unit, n = 1, with_ties = FALSE) |>
+    transmute(
+      measure = "Residents per residential unit",
+      census_tract = NAME,
+      value = residents_per_unit
+    ),
+  q3_sensitivity |>
+    filter(is.finite(residents_per_residential_sqft)) |>
+    slice_max(residents_per_residential_sqft, n = 1, with_ties = FALSE) |>
+    transmute(
+      measure = "Residents per residential square foot",
+      census_tract = NAME,
+      value = residents_per_residential_sqft
+    )
+)
+
+knitr::kable(
+  q3_sensitivity_results,
+  digits = 4,
+  caption = "Highest Density Ratios: Tracts with More Than 100 Residential Units"
+)
+```
+
+Brooklyn Census Tract 18.01 recorded the highest population density under both measures, with approximately 0.237 residents per residential square foot and 794 residents per recorded residential unit. These unusually high ratios suggest a potential mismatch between Census population estimates and residential property characteristics recorded in PLUTO.
+
+To assess the sensitivity of these findings, census tracts with 100 or fewer recorded residential units were excluded from a supplemental analysis. Accordingly, Bronx Census Tract 462.03 ranked highest under both measures, although the rankings of other tracts varied depending on whether residential square footage or housing units were used. These results suggest that differences in property classifications, group quarters, or incomplete housing records may influence the measured ratios, so these figures should not be interpreted as direct measures of residential overcrowding.
+
+## Q4. Which five metro areas outside NYC have the highest Dominican share?
+
+```{r}
+cbsa_population |>
+  filter(!startsWith(NAME, "New York-Newark-Jersey City")) |>
+  arrange(desc(dominican_share)) |>
+  slice_head(n = 5) |>
+  transmute(
+    "Metropolitan Area" = NAME,
+    "Dominican Population" = scales::comma(
+      dominican_population_estimate
+    ),
+    "Population Share" = scales::percent(
+      dominican_share, accuracy = 0.01
+    )
+  ) |>
   
-  This is a placeholder for STA9750 Mini-Project 3. Check back soon for more!
-  
+gt::gt() |>
+  gt::tab_header(
+    title = "Metropolitan Areas with the Highest Dominican Population Shares",
+    subtitle = "Top five outside NYC, 2025 ACS 1-year"
+  ) |>
+  gt::tab_source_note(
+    source_note = "Source: U.S. Census Bureau, 2025 ACS 1-year. Rankings limited to areas with available estimates."
+  )
+
+```
+Among metropolitan areas outside New York City with available estimates, Scranton–Wilkes-Barre, Pennsylvania, has the highest concentration of Dominican Americans, representing approximately 7.93% of its population. Although the Boston metropolitan area has a substantially larger Dominican population, its share is 3.72%, roughly half of Scranton-Wilkes-Barre. Notably, all five metropolitan areas are located in the Northeast, highlighting the region's concentration of Dominican communities beyond New York City.
+
+
+## Q5. Hispanic-Origin Composition of Boston
+
+```{r}
+
+#| label: task6-q5
+
+CITY_STATE <- "MA"
+CITY_NAME <- "Boston city, Massachusetts"
+
+city_cache <- file.path(
+  DATA_DIR,
+  paste0("acs1_", ACS1_YEAR, "_boston_origin.csv")
+)
+
+if (file.exists(city_cache)) {
+  city_ancestry <- readr::read_csv(
+    city_cache,
+    show_col_types = FALSE
+  )
+} else {
+  city_ancestry <- tidycensus::get_acs(
+    geography = "place",
+    state = CITY_STATE,
+    survey = "acs1",
+    year = ACS1_YEAR,
+    variables = c(
+      total = "B03001_001",
+      non_hispanic = "B03001_002",
+      hispanic = "B03001_003",
+      mexican = "B03001_004",
+      puerto_rican = "B03001_005",
+      cuban = "B03001_006",
+      dominican = "B03001_007"
+    )
+  ) |>
+    filter(NAME == CITY_NAME) |>
+    select(variable, estimate)
+
+  stopifnot(nrow(city_ancestry) == 7)
+
+  readr::write_csv(city_ancestry, city_cache)
+}
+
+city_ancestry <- city_ancestry |>
+  mutate(
+    share_of_city = estimate /
+      estimate[variable == "total"]
+  )
+
+
+city_total <- city_ancestry$estimate[
+  city_ancestry$variable == "total"
+]
+
+city_hispanic <- city_ancestry$estimate[
+  city_ancestry$variable == "hispanic"
+]
+
+boston_origin_summary <- city_ancestry |>
+  filter(variable %in% c(
+    "non_hispanic", "mexican", "puerto_rican",
+    "cuban", "dominican"
+  )) |>
+  select(variable, estimate) |>
+  bind_rows(
+    tibble(
+      variable = "other_hispanic",
+      estimate = city_hispanic -
+        sum(city_ancestry$estimate[
+          city_ancestry$variable %in% c(
+            "mexican", "puerto_rican",
+            "cuban", "dominican"
+          )
+        ])
+    )
+  ) |>
+  mutate(
+    variable = recode(
+      variable,
+      non_hispanic = "Non-Hispanic",
+      dominican = "Dominican",
+      puerto_rican = "Puerto Rican",
+      mexican = "Mexican",
+      cuban = "Cuban",
+      other_hispanic = "Other Hispanic origins"
+    ),
+    share = estimate / city_total
+  ) |>
+  arrange(desc(estimate))
+
+boston_origin_summary |>
+  gt::gt() |>
+  gt::fmt_number(columns = estimate, decimals = 0) |>
+  gt::fmt_percent(columns = share, decimals = 2) |>
+  gt::cols_label(
+    variable = "Population Group",
+    estimate = "Population",
+    share = "Share of Boston"
+  ) |>
+  gt::tab_header(
+    title = "Population by Hispanic Origin in Boston",
+    subtitle = "2025 ACS 1-year estimates"
+  ) |>
+  gt::tab_source_note(
+    source_note = "Source: U.S. Census Bureau, 2025 ACS 1-year."
+  )
+
+```
+According to the 2025 American Community Survey, about 43,750 Boston residents identify as Dominican, contributing 6.52% of the city's total population and nearly 31% of its Hispanic population. These findings highlight Boston's significance as a center of Dominican settlement outside the New York metropolitan area and reinforce the broader Northeast concentration of Dominican communities.
+
+## Q6. What proportion of Dominican-origin US residents live in New York or major metros?
+
+```{r}
+
+#| label: task6-q6
+
+q6_cache <- file.path(
+  DATA_DIR,
+  paste0("acs1_", ACS1_YEAR, "_us_ny_dominican.csv")
+)
+
+if (file.exists(q6_cache)) {
+
+  us_ny_population <- readr::read_csv(
+    q6_cache,
+    show_col_types = FALSE
+  )
+
+} else {
+
+  national <- tidycensus::get_acs(
+    geography = "us",
+    survey = "acs1",
+    year = ACS1_YEAR,
+    variables = c(dominican = "B03001_007")
+  ) |>
+    mutate(area = "United States")
+
+  ny_state <- tidycensus::get_acs(
+    geography = "state",
+    state = "NY",
+    survey = "acs1",
+    year = ACS1_YEAR,
+    variables = c(dominican = "B03001_007")
+  ) |>
+    mutate(area = "New York State")
+
+  us_ny_population <- bind_rows(
+    national,
+    ny_state
+  ) |>
+    select(area, estimate)
+
+  readr::write_csv(us_ny_population, q6_cache)
+}
+
+knitr::kable(
+  us_ny_population,
+  col.names = c("Geographic Area", "Dominican Population"),
+  format.args = list(big.mark = ",", scientific = FALSE)
+)
+
+```
+
+```{r}
+
+#| label: task6-q6-metros
+
+us_dominican <- us_ny_population |>
+  filter(area == "United States") |>
+  pull(estimate)
+
+
+top_metro_shares <- cbsa_population |>
+  filter(!grepl(", PR ", NAME, fixed = TRUE)) |>
+  arrange(desc(dominican_population_estimate)) |>
+  slice_head(n = 10) |>
+  transmute(
+    metropolitan_area = NAME,
+    dominican_population = dominican_population_estimate,
+    share_of_us = dominican_population_estimate / us_dominican
+  )
+
+top_metro_shares |>
+  gt::gt() |>
+  gt::fmt_number(
+    columns = dominican_population,
+    decimals = 0
+  ) |>
+  gt::fmt_percent(
+    columns = share_of_us,
+    decimals = 2
+  ) |>
+  gt::cols_label(
+    metropolitan_area = "Metropolitan Area",
+    dominican_population = "Dominican Population",
+    share_of_us = "Share of U.S. Dominican Population"
+  ) |>
+  gt::tab_header(
+    title = "Geographic Concentration of Dominican Americans",
+    subtitle = "Ten largest metropolitan populations, 2025 ACS 1-year"
+  ) |>
+  gt::tab_source_note(
+    source_note = "Source: U.S. Census Bureau, 2025 ACS 1-year. Rankings limited to metro areas with available estimates."
+  )
+```
+
+The 2025 American Community Survey estimates that approximately 2.75 million Dominican Americans reside in the United States, with 947,930, or 34.5%, living in New York State. The broader New York metropolitan area accounts for approximately 1.27 million Dominican residents, accounting for nearly half the national population.
+
+Outside the New York metropolitan area, Boston and Miami have the largest estimated Dominican populations, accounting for 6.81% and 5.21% of the national total, respectively. These findings demonstrate the particularly strong concentration of Dominican Americans in the Northeast, while also highlighting substantial communities in Florida. It should be noted that metropolitan comparisons here are limited to areas with available Census estimates.
+
+## Q7. Is the population–housing relationship approximately linear?
+
+```{r}
+#| label: task6-q7
+#| fig-width: 8
+#| fig-height: 5
+tract_analysis |>
+  sf::st_drop_geometry() |>
+  filter(tract_population > 0, residential_units > 0) |>
+  ggplot(aes(x = residential_units, y = tract_population)) +
+  geom_point(alpha = 0.25, color = "#2c5575") +
+  geom_smooth(method = "lm", se = FALSE, color = "#ba6342") +
+  scale_x_continuous(labels = scales::label_comma()) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  labs(title = "Population and residential housing units across NYC tracts",
+       x = "Residential units (PLUTO)",
+       y = "Estimated tract population (ACS 2024 5-year)",
+       caption = "Different source years; comparison is exploratory.") +
+  theme_minimal()
+```
+The relationship between residential housing units and census tract population appears more or less linear.  What that says in the context of this analysis is that tracts containing more residential units generally support larger populations. Most observations cluster around the fitted regression line, although the variation increases among tracts with larger numbers of residential units. There are some outliers that exhibit relatively low populations despite having substantial residential housing inventories. These differences may be explained by variations in occupancy rates, household sizes, or inconsistencies between Census population estimates and PLUTO property records.
+
+## Q8. Which NTAs contain the highest recorded buildings?
+
+```{r}
+#| label: task6-q8
+q8 <- tract_analysis |>
+  sf::st_drop_geometry() |>
+  filter(!is.na(nta2020)) |>
+  group_by(nta2020, ntaname) |>
+  summarise(max_reported_floors = if (all(is.na(tallest_lot_floors))) NA_real_
+              else max(tallest_lot_floors, na.rm = TRUE),
+            .groups = "drop") |>
+  arrange(desc(max_reported_floors)) |>
+  slice_head(n = 10)
+knitr::kable(q8, caption = "NTAs with highest maximum reported number of floors")
+```
+Although more than two-thirds of the NTAs listed above are in Manhattan, particularly in or adjacent to its major commercial districts, both Downtown Brooklyn and Long Island City also contain buildings among the tallest recorded in the city.
+
+It should be pointed out that the PLUTO data included one building with a reported height of 343 floors in the Borough Park section of Brooklyn. This seemed highly implausible, so the record was excluded from the building-height analysis.
+
+## Q9. Map population density across NYC census tracts
+
+```{r}
+#| label: task6-q9
+#| fig-width: 9
+#| fig-height: 8
+tract_analysis |>
+  filter(!is.na(residents_per_sqkm), residents_per_sqkm >= 0) |>
+  ggplot(aes(fill = residents_per_sqkm)) +
+  geom_sf(color = NA) +
+  scale_fill_viridis_c(labels = scales::label_comma(),
+                       trans = "sqrt", na.value = "grey90") +
+  labs(title = "Population density across New York City",
+       subtitle = "Estimated residents per square kilometer of tract area",
+       fill = "Residents / km²",
+       caption = "Source: 2024 ACS 5-year; Census tract boundaries via tidycensus.") +
+  theme_void()
+```
+The estimates shown in this map illustrate considerable variation in population density across New York City. Manhattan and parts of the Bronx, Brooklyn, and Queens have the highest concentrations, while Staten Island is generally less densely populated. Population density is calculated using total census tract area, including parks and other nonresidential land.
+
+## Q10. How many New Yorkers live in primarily commercial areas?
+
+In this analysis, a census tract is classified as primarily commercial if it contains at least 100,000 square feet of recorded commercial floor area and its commercial floor area is at least three times its residential floor area.  
+```{r}
+#| label: task6-q10
+q10 <- tract_analysis |>
+  sf::st_drop_geometry() |>
+  mutate(
+    primarily_commercial =
+      commercial_sqft >= 100000 &
+      commercial_sqft >= 3 * pmax(residential_sqft, 1)
+  ) |>
+  filter(!is.na(primarily_commercial), !is.na(tract_population)) |>
+  summarise(
+    commercial_tract_count = sum(primarily_commercial),
+    residents_in_commercial_tracts = sum(tract_population[primarily_commercial]),
+    city_population_included = sum(tract_population),
+    share_of_population = residents_in_commercial_tracts / city_population_included
+  )
+knitr::kable(q10, digits = 3)
+```
+``` {r}
+#| label: task6-q10-sensitivity
+
+q10_sensitivity <- dplyr::bind_rows(
+  lapply(c(2, 3, 5), function(ratio) {
+
+    tract_analysis |>
+      sf::st_drop_geometry() |>
+      mutate(
+        primarily_commercial =
+          commercial_sqft >= 100000 &
+          commercial_sqft >= ratio * pmax(residential_sqft, 1)
+      ) |>
+      filter(
+        !is.na(primarily_commercial),
+        !is.na(tract_population)
+      ) |>
+      summarise(
+        threshold = paste0(ratio, ":1"),
+        commercial_tracts = sum(primarily_commercial),
+        residents = sum(tract_population[primarily_commercial]),
+        population_share = residents / sum(tract_population)
+      )
+  })
+)
+
+q10_sensitivity |>
+  mutate(
+    residents = scales::comma(residents),
+    population_share = scales::percent(population_share, accuracy = 0.01)
+  ) |>
+  knitr::kable(
+    caption = "Sensitivity to Commercial Floor Area Thresholds"
+  )
+```
+Based on this definition, approximately 149,699 New Yorkers, or 1.77% of the city's population, live in 123 primarily commercial census tracts.  Recall that a census tract is classified as primarily commercial if its commercial floor area is at least three times its residential floor area and it contains at least 100,000 square feet of commercial space.
+
+However, the results are sensitive to the criteria used. Lowering the required ratio of commercial to residential floor area from 3:1 to 2:1 increases the estimated population to 255,398 residents. Raising the ratio to 5:1 reduces the estimate to 86,101 residents. While relatively few New Yorkers live in predominantly commercial areas, the results demonstrate how the definition of these areas can significantly affect the estimated population.
+
+# Supplemental Analysis: Housing Tenure and Interactive Visualization
+
+The supplemental analysis explores the relationship between Dominican-origin population concentration and renter occupancy across New York City census tracts. These are descriptive, neighborhood-level associations and should not be interpreted as evidence of a causal relationship. Housing tenure measures describe occupied housing units rather than the demographic characteristics of individual households.
+
+## Download and cache additional ACS housing and income tables
+
+Additional data from the 2020-2024 American Community Survey (ACS) were obtained to explore housing tenure and household income across New York City census tracts.  The analysis uses the following variables:
+
+| Census table | Variable | Description |
+|:--|:--|:--|
+| `B25003` (Tenure) | `B25003_001` | Occupied housing units |
+| `B25003` (Tenure) | `B25003_003` | Renter-occupied housing units |
+| `B19013` (Median Household Income) | `B19013_001` | Median household income, 2024 inflation-adjusted dollars |
+
+These estimates cover the same ACS reporting period as the NYC population data and were cached locally to avoid repeated downloads. Of the 2,327 census tracts examined, 2,232 had usable renter-occupancy estimates and 2,199 had usable median household income estimates.  The housing tenure data were subsequently used to examine renter-occupancy in neighborhoods with substantial Dominican populations. 
+```{r}
+#| label: extra-acs-housing-income
+
+load_tract_housing_income <- function(year = ACS5_YEAR, data_dir = DATA_DIR) {
+  dir.create(data_dir, recursive = TRUE, showWarnings = FALSE)
+  cache_path <- file.path(data_dir, paste0("acs5_", year, "_nyc_housing_income.csv"))
+
+  if (!file.exists(cache_path) || file.info(cache_path)$size == 0) {
+    extra_raw <- tidycensus::get_acs(
+      geography = "tract",
+      state = "NY",
+      county = c("Bronx", "Kings", "New York", "Queens", "Richmond"),
+      year = year,
+      survey = "acs5",
+      geometry = FALSE,
+      output = "wide",
+      cache_table = TRUE,
+      variables = c(
+        occupied_units = "B25003_001",
+        renter_units = "B25003_003",
+        median_income = "B19013_001"
+      )
+    )
+
+    readr::write_csv(extra_raw, cache_path)
+  }
+
+  readr::read_csv(
+    cache_path,
+    col_types = readr::cols(
+      GEOID = readr::col_character(),
+      .default = readr::col_guess()
+    ),
+    show_col_types = FALSE
+  )
+}
+
+tract_housing_income <- load_tract_housing_income()
+stopifnot(!anyDuplicated(tract_housing_income$GEOID))
+
+extra_tracts <- nyc_tracts |>
+  sf::st_drop_geometry() |>
+  select(GEOID, NAME, tract_population, tract_dominican,
+         tract_dominican_share) |>
+  left_join(
+    tract_housing_income |>
+      select(GEOID, occupied_unitsE, renter_unitsE, median_incomeE),
+    by = "GEOID"
+  ) |>
+  mutate(
+    renter_share = if_else(
+      occupied_unitsE > 0 & renter_unitsE >= 0,
+      renter_unitsE / occupied_unitsE,
+      NA_real_
+    ),
+    # Census can use negative values for missing/suppressed medians.
+    median_income = if_else(median_incomeE > 0,
+                            as.numeric(median_incomeE), NA_real_)
+  )
+
+stopifnot(nrow(extra_tracts) == nrow(nyc_tracts))
+message("NYC tracts with usable renter share: ",
+        sum(!is.na(extra_tracts$renter_share)))
+message("NYC tracts with usable median household income: ",
+        sum(!is.na(extra_tracts$median_income)))
+```
+
+## Compare renter occupancy across NYC neighborhoods
+```{r}
+#| label: extra-nta-tenure-table`
+
+nta_renter_context <- tract_nta_key |>
+  filter(!is.na(nta2020)) |>
+  left_join(
+    tract_housing_income |>
+      select(GEOID, occupied_unitsE, renter_unitsE),
+    by = "GEOID"
+  ) |>
+  group_by(nta2020) |>
+  summarise(
+    occupied_units = sum(pmax(occupied_unitsE, 0), na.rm = TRUE),
+    renter_units = sum(pmax(renter_unitsE, 0), na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    renter_share = if_else(occupied_units > 0,
+                           renter_units / occupied_units, NA_real_)
+  ) |>
+  left_join(
+    nta_population_map |>
+      sf::st_drop_geometry() |>
+      select(nta2020, ntaname, nta_population,
+             nta_dominican, nta_dominican_share),
+    by = "nta2020"
+  )
+
+nta_renter_context |>
+  filter(nta_population >= 1000, occupied_units >= 100) |>
+  arrange(desc(nta_dominican_share)) |>
+  slice_head(n = 10) |>
+  select(ntaname, nta_dominican, nta_dominican_share, renter_share) |>
+  gt() |>
+  tab_header(
+    title = "Dominican-origin concentration and renter occupancy",
+    subtitle = "Selected NYC NTAs, 2024 ACS five-year estimates"
+  ) |>
+  cols_label(
+    ntaname = "Neighborhood area",
+    nta_dominican = "Dominican-origin residents",
+    nta_dominican_share = "Dominican-origin share",
+    renter_share = "Renter-occupied share"
+  ) |>
+  fmt_number(columns = nta_dominican, decimals = 0) |>
+  fmt_percent(columns = c(nta_dominican_share, renter_share), decimals = 1) |>
+  tab_source_note(
+    source_note = "ACS B03001, B01003, B25003; tracts allocated to NTAs by largest spatial intersection. Survey estimates."
+  )
+```
+Neighborhoods with large Dominican communities also tend to have high rates of renter occupancy. This pattern is particularly evident in Inwood and Washington Heights, where the majority of occupied housing units are rented rather than owned. While renter occupancy varies across these neighborhoods, the overall figures suggest that renting is a defining characteristic of their housing markets.
+
+## Interactive non-map chart 
+
+The interactive scatterplot here illustrates the relationship between Dominican population concentration and renter-occupancy across New York City census tracts. Hovering over individual observations will show the census tract, Dominican population share, renter-occupancy rate, and estimated population.
+
+```r
+# Run once in the R Console, if needed (not in an executable report chunk):
+install.packages("ggiraph")
+```
+
+```{r}
+#| label: extra-interactive-scatter
+
+plot_data <- extra_tracts |>
+  filter(
+    tract_population >= 100,
+    occupied_unitsE >= 50,
+    between(tract_dominican_share, 0, 1),
+    between(renter_share, 0, 1)
+  ) |>
+  mutate(
+    hover_text = paste0(
+      NAME,
+      "\nDominican-origin share: ",
+      scales::percent(tract_dominican_share, accuracy = 0.1),
+      "\nRenter-occupied share: ",
+      scales::percent(renter_share, accuracy = 0.1),
+      "\nEstimated residents: ", scales::comma(tract_population)
+    )
+  )
+
+interactive_scatter <- ggplot(
+  plot_data,
+  aes(x = tract_dominican_share, y = renter_share)
+) +
+  ggiraph::geom_point_interactive(
+    aes(tooltip = hover_text, data_id = GEOID),
+    alpha = 0.45,
+    size = 1.8,
+    color = "#284f70"
+  ) +
+  scale_x_continuous(labels = scales::label_percent()) +
+  scale_y_continuous(labels = scales::label_percent()) +
+  labs(
+    title = "Dominican-origin concentration and rental housing across NYC tracts",
+    subtitle = "Hover over a point for census tract estimates",
+    x = "Dominican-origin share of tract residents",
+    y = "Renter-occupied share of occupied housing units",
+    caption = "Source: 2024 ACS five-year tables B03001, B01003 and B25003."
+  ) +
+  theme_minimal(base_size = 12)
+
+ggiraph::girafe(ggobj = interactive_scatter, width_svg = 9, height_svg = 6)
+```
+The relationship between Dominican population concentration and renter occupancy varies considerably across New York City's census tracts. Tracts with relatively small Dominican populations exhibit a wide range of renter-occupancy rates, while those with higher Dominican population shares generally display elevated levels of renter occupancy. This pattern is consistent with the high renter-occupancy rates observed in Washington Heights, Inwood, and several Bronx neighborhoods.
+
+However, the substantial variation across census tracts indicates that the concentration of Dominican population alone does not explain differences in housing tenure. Other factors, including neighborhood housing stock, income, and historical development patterns, may also contribute to these differences. The observed relationship should therefore be interpreted as descriptive rather than causal.
+
+# Task 7: Atlas of American Communities entry
+
+## Map 1. Dominican communities across NYC neighborhoods
+```{r}
+#| label: task7-map-nyc
+#| fig-width: 9
+#| fig-height: 8
+nta_population_map |>
+  ggplot(aes(fill = nta_dominican_share)) +
+  geom_sf(color = "white", linewidth = 0.12) +
+  scale_fill_viridis_c(labels = scales::label_percent(),
+                       na.value = "grey90", option = "magma") +
+  labs(title = "Dominican-origin share by NYC neighborhood area",
+       subtitle = "2024 ACS five-year estimates, aggregated to 2020 NTAs",
+       fill = "Dominican share",
+       caption = "Source: US Census ACS; NYC DCP NTA boundaries. Tracts assigned by largest intersection.") +
+  theme_void()
+```
+
+## Map 2. Dominican communities across the United States
+```{r}
+#| label: task7-map-us
+#| fig-width: 11
+#| fig-height: 7
+
+state_cache <- file.path(
+  DATA_DIR,
+  paste0("acs1_", ACS1_YEAR, "_state_dominican.gpkg")
+)
+
+# Use the locally saved file if available.
+if (file.exists(state_cache)) {
+
+  state_geo <- sf::st_read(
+    state_cache,
+    quiet = TRUE
+  )
+
+} else {
+
+  # Retrieve state-level Census estimates and geometry.
+  state_geo <- tidycensus::get_acs(
+    geography = "state",
+    year = ACS1_YEAR,
+    survey = "acs1",
+    variables = c(
+      total_population = "B01003_001",
+      dominican_population = "B03001_007"
+    ),
+    geometry = TRUE,
+    output = "wide",
+    cache_table = TRUE
+  )
+
+  # Save both Census data and geographic boundaries.
+  sf::st_write(
+    state_geo,
+    state_cache,
+    delete_dsn = TRUE,
+    quiet = TRUE
+  )
+}
+
+# Create the national map.
+state_geo |>
+  filter(!NAME %in% c(
+    "Alaska", "Hawaii", "Puerto Rico"
+  )) |>
+  mutate(
+    dominican_share = if_else(
+      total_populationE > 0 &
+        dominican_populationE >= 0,
+      dominican_populationE / total_populationE,
+      NA_real_
+    )
+  ) |>
+  ggplot(aes(fill = dominican_share)) +
+  geom_sf(color = "white", linewidth = 0.25) +
+  scale_fill_viridis_c(
+    labels = scales::label_percent(),
+    na.value = "grey90",
+    option = "magma"
+  ) +
+  labs(
+    title = "Dominican-origin share across U.S. states",
+    subtitle = "Contiguous United States, 2025 ACS 1-year estimates",
+    fill = "Dominican share",
+    caption = paste(
+      "Source: U.S. Census Bureau, 2025 ACS.",
+      "Gray indicates unavailable estimates.",
+      "Alaska and Hawaii not shown."
+    )
+  ) +
+  theme_void()
+```
+## From Washington Heights to the Rest of America
+
+Washington Heights carries a longstanding cultural significance for Dominican Americans in New York City, with its influence extending into many areas of American popular culture. As a resident of the neighborhood, I am interested to know how this community became established in northern Manhattan and how its presence has expanded across the United States. Although Washington Heights remains closely associated with Dominican identity, Census data reveal a much broader pattern of settlement.
+
+Dominican migration increased following the assassination of dictator Rafael Trujillo in 1961, amid political instability, economic hardship, and changes in U.S. immigration policy. Washington Heights became an important destination where immigrants established businesses, cultural organizations, and community institutions. 
+
+The first map illustrates where Dominican Americans are most concentrated across New York City. Washington Heights and neighboring Inwood form a shared center for Dominican communities in upper Manhattan, with a similarly strong presence in parts of the Bronx. Beyond these concentrated areas, Dominican communities are more spread out across Brooklyn, Queens, and Staten Island.
+
+The national map places these patterns in a broader context. According to the 2025 American Community Survey, approximately **2.75 million** U.S. residents identify as Dominican. New York State accounts for **947,930**, or **34.5%**, while the broader New York metropolitan area, including portions of New Jersey and Pennsylvania, contains approximately **1.27 million**, or **46.1%** of the national total.
+
+Outside New York, the Boston metropolitan area has approximately **187,318 Dominican residents**, followed by Miami with **143,327** and Philadelphia with **93,806**. These figures highlight the community's strong concentration in the northeastern United States alongside its presence in Florida and other regions.
+
+Research from the [CUNY Graduate Center](https://clacls.gc.cuny.edu/dominican-population-in-nyc-after-1980/) also documents Dominican settlement beyond New York City's original immigrant neighborhoods, including surrounding suburban counties. This expansion reflects a community whose geographic presence has grown while maintaining strong cultural ties to Washington Heights.
+
+Together, the maps illustrate how Washington Heights fits into a larger history of Dominican migration and settlement. The neighborhood remains an important cultural center, but it represents only one part of a much broader Dominican-American community.
+
+*Data notes: NYC neighborhood estimates use the 2020–2024 ACS 5-year data and assign census tracts to NTAs using their largest geographic intersection. State and metropolitan estimates use the 2025 ACS 1-year data. Unavailable estimates are not interpreted as zero population.*
+
+# Conclusion
+The analysis reveals a strong geographic concentration of Dominican Americans in the northeastern United States, particularly within the New York metropolitan area. According to the 2025 American Community Survey, approximately 46.1% of the nation's Dominican population resides in the New York metropolitan area, while 34.5% lives in New York State. Within New York City, Washington Heights and neighboring communities in northern Manhattan and the Bronx remain important centers of Dominican settlement, reflecting the community's longstanding historical and cultural ties to these neighborhoods.
+
+The analysis also highlights the relationship between population distribution and patterns of residential and commercial development across New York City. Residential housing units are positively associated with census tract population, although differences in housing characteristics and several unusual observations complicate this relationship. 
+
+# Sources and documentation
+- U.S. Census Bureau: ACS 2025 one-year detailed tables and ACS 2024 five-year detailed tables, B03001 and B01003.
+- Optional extra-credit Census tables: 2024 ACS five-year B25003 (Tenure) and B19013 (Median Household Income).
+- NYC Department of City Planning: 2020 Neighborhood Tabulation Areas, NYC Open Data dataset `9nt8-h7nd`.
+- NYC Department of City Planning: PLUTO, NYC Open Data dataset `64uk-42ks`.
+
+## Historical and Demographic Research
+- **City College of New York (2024).** [CUNY DSI-backed Washington Heights makes HDC's 2024 "Six to Celebrate" list](https://www.ccny.cuny.edu/news/cuny-dsi-backed-washington-heights-makes-hdcs-2024-six-celebrate-list). Documents the historical and cultural importance of Washington Heights to the Dominican-American community.
+
+- **CUNY Graduate Center, Center for Latin American, Caribbean and Latino Studies (2021).** [The Dominican Population in New York](https://clacls.gc.cuny.edu/dominican-population-in-nyc-after-1980/). Examines Dominican settlement throughout the New York metropolitan region, including migration beyond Washington Heights into the Bronx and surrounding counties.
+
+- **Marrow, Brandon, and Jeanne Batalova (2024).** [Immigrants from the Dominican Republic in the United States](https://www.migrationpolicy.org/journal/spotlight/immigrants-dominican-republic-united-states). Migration Policy Institute. Provides historical context for Dominican migration following 1961, subsequent immigration patterns, and the geographic distribution of Dominican immigrants.
+
+
+::: {.callout-note title="AI Usage Statement" collapse="true"}
+
+ChatGPT was used to assist with writing and debugging code, especially for acquiring the census data as this was my first time working with an API.
+
+I also used ChatGPT to suggest credible sources for background information on Dominican-American communities and migration history.   
+
+:::
